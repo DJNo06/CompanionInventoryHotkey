@@ -6,10 +6,14 @@
 #include <F4SE/Interfaces.h>
 
 #include <RE/B/BSFixedString.h>
+#include <RE/B/BSTEvent.h>
 #include <RE/B/ButtonEvent.h>
+#include <RE/C/ContainerMenu.h>
+#include <RE/M/MenuOpenCloseEvent.h>
 #include <RE/P/PlayerCharacter.h>
 #include <RE/P/PlayerControls.h>
-#include <RE/R/ReadyWeaponHandler.h>
+#include <RE/Q/QuickContainerMode.h>
+#include <RE/Q/QuickContainerStateEvent.h>
 #include <RE/T/TESBoundObject.h>
 #include <RE/T/TESForm.h>
 #include <RE/T/TESObjectREFR.h>
@@ -20,7 +24,6 @@
 #include <Windows.h>
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -33,7 +36,9 @@ namespace Hotkey
 	{
 		std::atomic_uint32_t g_vk{ 0x75 };
 		std::atomic_bool     g_running{ false };
-		std::atomic_bool     g_inputHooksInstalled{ false };
+		std::atomic_bool     g_containerMenuHookInstalled{ false };
+		std::atomic_bool     g_quickContainerHookInstalled{ false };
+		std::atomic_bool     g_menuTraceInstalled{ false };
 		std::thread          g_thread;
 
 		constexpr std::uint32_t kBankVk = 0xBA;                    // $
@@ -44,17 +49,11 @@ namespace Hotkey
 		constexpr std::uint32_t kTransferChunk = 60000;           // caps : sécurité
 		constexpr std::uint32_t kMoneyConvertChunk = 6000;        // 6000 money -> 60000 caps max
 
-		// Empirically, slot 1 is the QCOpenTransferMenu-related button callback
-		// for the player input handlers we are inspecting.
-		constexpr std::size_t kInputHandlerQCSlot = 1;
-
-		// TEST MODE:
-		// Observation only for now.
-		constexpr bool kBlockReadyWeaponQCOpenTransferMenuOriginal = false;
-		constexpr bool kBlockActivateQCOpenTransferMenuOriginal = false;
-		constexpr bool kBlockOtherQCOpenTransferMenuOriginal = false;
-		constexpr std::size_t kMaxHookedHandlers = 24;
-		constexpr std::size_t kMaxHookedVTables = 24;
+		constexpr std::size_t kContainerMenuProcessMessageSlot = 3;
+		constexpr std::size_t kEventSinkProcessEventSlot = 1;
+		constexpr std::size_t kPlayerControlsQuickContainerSinkOffset = 0x38;
+		constexpr bool        kBlockPlayerControlsQuickContainerOriginal = false;
+		constexpr bool        kBlockContainerMenuShowMessage = true;
 
 		inline bool IsDown(int vk) noexcept
 		{
@@ -190,186 +189,274 @@ namespace Hotkey
 			}
 		}
 
-		struct HookedHandler
+		[[nodiscard]] const char* QuickContainerModeName(RE::QuickContainerMode a_mode) noexcept
 		{
-			const char* name{ nullptr };
-			void*       instance{ nullptr };
-			bool        blockOriginal{ false };
-		};
-
-		struct HookedVTable
-		{
-			void** vtbl{ nullptr };
-			using func_t = void(*)(void*, const RE::ButtonEvent*);
-			func_t original{ nullptr };
-		};
-
-		std::array<HookedHandler, kMaxHookedHandlers> g_hookedHandlers{};
-		std::array<HookedVTable, kMaxHookedVTables>   g_hookedVTables{};
-		std::size_t                                   g_hookedHandlerCount = 0;
-		std::size_t                                   g_hookedVTableCount = 0;
-
-		HookedHandler* FindHookedHandler(void* a_instance) noexcept
-		{
-			for (std::size_t i = 0; i < g_hookedHandlerCount; ++i) {
-				if (g_hookedHandlers[i].instance == a_instance) {
-					return std::addressof(g_hookedHandlers[i]);
-				}
+			switch (a_mode) {
+			case RE::QuickContainerMode::kLoot:
+				return "Loot";
+			case RE::QuickContainerMode::kTeammate:
+				return "Teammate";
+			case RE::QuickContainerMode::kPowerArmor:
+				return "PowerArmor";
+			case RE::QuickContainerMode::kTurret:
+				return "Turret";
+			case RE::QuickContainerMode::kWorkshop:
+				return "Workshop";
+			case RE::QuickContainerMode::kCrafting:
+				return "Crafting";
+			case RE::QuickContainerMode::kStealing:
+				return "Stealing";
+			case RE::QuickContainerMode::kStealingPowerArmor:
+				return "StealingPowerArmor";
+			default:
+				return "Unknown";
 			}
-
-			return nullptr;
 		}
 
-		HookedVTable* FindHookedVTable(void** a_vtbl) noexcept
+		[[nodiscard]] std::uint32_t ResolveHandleFormID(RE::ObjectRefHandle a_handle) noexcept
 		{
-			for (std::size_t i = 0; i < g_hookedVTableCount; ++i) {
-				if (g_hookedVTables[i].vtbl == a_vtbl) {
-					return std::addressof(g_hookedVTables[i]);
-				}
-			}
-
-			return nullptr;
+			auto ref = a_handle.get();
+			return ref ? ref->GetFormID() : 0;
 		}
 
-		void RegisterHookedHandler(const char* a_name, void* a_instance, bool a_blockOriginal) noexcept
+		[[nodiscard]] std::uint32_t HandleValue(RE::ObjectRefHandle a_handle) noexcept
 		{
-			if (!a_instance || FindHookedHandler(a_instance)) {
-				return;
-			}
-
-			if (g_hookedHandlerCount >= g_hookedHandlers.size()) {
-				REX::WARN("Hotkey: handler registry full, cannot register {}", a_name ? a_name : "unknown");
-				return;
-			}
-
-			g_hookedHandlers[g_hookedHandlerCount++] = HookedHandler{ a_name, a_instance, a_blockOriginal };
+			return a_handle.get_handle();
 		}
 
-		void RegisterHookedVTable(void** a_vtbl, HookedVTable::func_t a_original) noexcept
+		[[nodiscard]] const char* UIMessageTypeName(RE::UI_MESSAGE_TYPE a_type) noexcept
 		{
-			if (!a_vtbl || FindHookedVTable(a_vtbl)) {
-				return;
+			switch (a_type) {
+			case RE::UI_MESSAGE_TYPE::kUpdate:
+				return "Update";
+			case RE::UI_MESSAGE_TYPE::kShow:
+				return "Show";
+			case RE::UI_MESSAGE_TYPE::kReshow:
+				return "Reshow";
+			case RE::UI_MESSAGE_TYPE::kHide:
+				return "Hide";
+			case RE::UI_MESSAGE_TYPE::kForceHide:
+				return "ForceHide";
+			case RE::UI_MESSAGE_TYPE::kScaleformEvent:
+				return "ScaleformEvent";
+			case RE::UI_MESSAGE_TYPE::kUserEvent:
+				return "UserEvent";
+			case RE::UI_MESSAGE_TYPE::kInventoryUpdate:
+				return "InventoryUpdate";
+			case RE::UI_MESSAGE_TYPE::kUserProfileChange:
+				return "UserProfileChange";
+			case RE::UI_MESSAGE_TYPE::kMUStatusChange:
+				return "MUStatusChange";
+			case RE::UI_MESSAGE_TYPE::kResumeCaching:
+				return "ResumeCaching";
+			case RE::UI_MESSAGE_TYPE::kUpdateController:
+				return "UpdateController";
+			case RE::UI_MESSAGE_TYPE::kChatterEvent:
+				return "ChatterEvent";
+			default:
+				return "Unknown";
 			}
-
-			if (g_hookedVTableCount >= g_hookedVTables.size()) {
-				REX::WARN("Hotkey: vtable registry full, cannot register {:p}", static_cast<void*>(a_vtbl));
-				return;
-			}
-
-			g_hookedVTables[g_hookedVTableCount++] = HookedVTable{ a_vtbl, a_original };
 		}
 
-		struct GenericInputHook
+		struct ContainerMenuProcessMessageHook
 		{
-			using event_t = RE::ButtonEvent;
+			using menu_t = RE::ContainerMenu;
+			using func_t = RE::UI_MESSAGE_RESULTS(*)(menu_t*, RE::UIMessage&);
 
-			static void Thunk(void* a_this, const event_t* a_event)
+			static inline func_t _original{ nullptr };
+
+			static RE::UI_MESSAGE_RESULTS Thunk(menu_t* a_this, RE::UIMessage& a_message)
 			{
-				bool        blockOriginal = false;
-				const char* handlerName = "Unknown";
+				const auto type = static_cast<RE::UI_MESSAGE_TYPE>(a_message.type.underlying());
+				const bool shouldLog =
+					type == RE::UI_MESSAGE_TYPE::kShow ||
+					type == RE::UI_MESSAGE_TYPE::kReshow ||
+					type == RE::UI_MESSAGE_TYPE::kHide ||
+					type == RE::UI_MESSAGE_TYPE::kForceHide;
 
-				if (auto* handler = FindHookedHandler(a_this); handler) {
-					handlerName = handler->name ? handler->name : handlerName;
-					blockOriginal = handler->blockOriginal;
+				if (shouldLog) {
+					REX::INFO(
+						"ContainerMenu: ProcessMessage type={} ({}) menu='{}' this={:p} containerRef={:08X}/{:08X} menuOpening={} suppressed={}",
+						static_cast<std::int32_t>(type),
+						UIMessageTypeName(type),
+						a_message.menu.c_str(),
+						static_cast<void*>(a_this),
+						HandleValue(a_this->containerRef),
+						ResolveHandleFormID(a_this->containerRef),
+						a_this->menuOpening,
+						a_this->suppressed);
 				}
 
-				if (a_event && a_event->QJustPressed()) {
-					const auto& action = a_event->QUserEvent();
-
-					if (!action.empty() && action == "QCOpenTransferMenu") {
-						REX::INFO(
-							"[INPUT][{}] slot={} action='{}' value={} held={} handler={:p}",
-							handlerName,
-							kInputHandlerQCSlot,
-							action.c_str(),
-							a_event->value,
-							a_event->heldDownSecs,
-							a_this);
-
-						if (blockOriginal) {
-							REX::INFO("Hotkey(test): blocking {} original QCOpenTransferMenu", handlerName);
-						}
-					}
+				if (kBlockContainerMenuShowMessage &&
+					(type == RE::UI_MESSAGE_TYPE::kShow || type == RE::UI_MESSAGE_TYPE::kReshow)) {
+					REX::INFO("ContainerMenu(test): blocking ProcessMessage {}", UIMessageTypeName(type));
+					return RE::UI_MESSAGE_RESULTS::kHandled;
 				}
 
-				auto** vtbl = a_this ? *reinterpret_cast<void***>(a_this) : nullptr;
-				auto*  hook = FindHookedVTable(vtbl);
-				if (!blockOriginal && hook && hook->original) {
-					hook->original(a_this, a_event);
-				}
+				return _original ? _original(a_this, a_message) : RE::UI_MESSAGE_RESULTS::kPassOn;
 			}
 		};
 
-		void InstallNamedHandlerHook(const char* a_name, void* a_handler, bool a_blockOriginal)
-		{
-			if (!a_handler) {
-				return;
-			}
-
-			RegisterHookedHandler(a_name, a_handler, a_blockOriginal);
-
-			auto** vtbl = *reinterpret_cast<void***>(a_handler);
-			if (!vtbl) {
-				REX::WARN("Hotkey: {} vtable not resolved", a_name ? a_name : "unknown");
-				return;
-			}
-
-			if (!FindHookedVTable(vtbl)) {
-				auto original =
-					reinterpret_cast<HookedVTable::func_t>(vtbl[kInputHandlerQCSlot]);
-				RegisterHookedVTable(vtbl, original);
-
-				WritePointer(
-					std::addressof(vtbl[kInputHandlerQCSlot]),
-					reinterpret_cast<const void*>(GenericInputHook::Thunk));
-			}
-
-			REX::INFO(
-				"Hotkey: hooked {} handler={:p} vtbl={:p} slot={} block={}",
-				a_name ? a_name : "unknown",
-				a_handler,
-				static_cast<void*>(vtbl),
-				kInputHandlerQCSlot,
-				a_blockOriginal);
-		}
-
-		void InstallPlayerControlsInputHooks()
+		void InstallContainerMenuProcessMessageHook()
 		{
 			bool expected = false;
-			if (!g_inputHooksInstalled.compare_exchange_strong(expected, true)) {
+			if (!g_containerMenuHookInstalled.compare_exchange_strong(expected, true)) {
+				return;
+			}
+
+			REL::Relocation<std::uintptr_t> vtblRel{ RE::VTABLE::ContainerMenu[0] };
+			auto** vtbl = reinterpret_cast<void**>(vtblRel.address());
+			if (!vtbl) {
+				REX::WARN("Hotkey: ContainerMenu vtable not resolved");
+				g_containerMenuHookInstalled.store(false, std::memory_order_relaxed);
+				return;
+			}
+
+			ContainerMenuProcessMessageHook::_original =
+				reinterpret_cast<ContainerMenuProcessMessageHook::func_t>(vtbl[kContainerMenuProcessMessageSlot]);
+
+			WritePointer(
+				std::addressof(vtbl[kContainerMenuProcessMessageSlot]),
+				reinterpret_cast<const void*>(ContainerMenuProcessMessageHook::Thunk));
+
+			REX::INFO("Hotkey: ContainerMenu ProcessMessage hook installed");
+			REX::INFO("Hotkey:  - handler vtbl       = {:p}", static_cast<void*>(vtbl));
+			REX::INFO("Hotkey:  - hooked slot        = {}", kContainerMenuProcessMessageSlot);
+			REX::INFO("Hotkey:  - original slot[{}]  = {:p}", kContainerMenuProcessMessageSlot, reinterpret_cast<void*>(ContainerMenuProcessMessageHook::_original));
+			REX::INFO("Hotkey:  - block show         = {}", kBlockContainerMenuShowMessage);
+		}
+
+		struct PlayerControlsQuickContainerHook
+		{
+			using event_t = RE::QuickContainerStateEvent;
+			using source_t = RE::BSTEventSource<event_t>;
+			using func_t = RE::BSEventNotifyControl(*)(void*, const event_t&, source_t*);
+
+			static inline func_t _original{ nullptr };
+
+			static RE::BSEventNotifyControl Thunk(void* a_this, const event_t& a_event, source_t* a_source)
+			{
+				if (a_event.optionalValue.has_value()) {
+					const auto& data = a_event.optionalValue.value();
+					const auto  mode = static_cast<RE::QuickContainerMode>(data.mode.underlying());
+
+					REX::INFO(
+						"QuickContainer: mode={} ({}) container={:08X}/{:08X} inventory={:08X}/{:08X} items={} activated={} isNew={} locked={} A={} X={}",
+						static_cast<std::int32_t>(mode),
+						QuickContainerModeName(mode),
+						HandleValue(data.containerRef),
+						ResolveHandleFormID(data.containerRef),
+						HandleValue(data.inventoryRef),
+						ResolveHandleFormID(data.inventoryRef),
+						data.itemData.size(),
+						data.containerActivated,
+						data.isNewContainer,
+						data.isLocked,
+						data.buttonAEnabled,
+						data.buttonXEnabled);
+
+					REX::INFO(
+						"QuickContainer: containerName='{}' aButton='{}' perkButton='{}'",
+						data.containerName.c_str(),
+						data.aButtonText.c_str(),
+						data.perkButtonText.c_str());
+				}
+				else {
+					REX::INFO("QuickContainer: event received without payload");
+				}
+
+				if (kBlockPlayerControlsQuickContainerOriginal) {
+					REX::INFO("QuickContainer(test): blocking PlayerControls QuickContainerStateEvent");
+					return RE::BSEventNotifyControl::kStop;
+				}
+
+				return _original ? _original(a_this, a_event, a_source) : RE::BSEventNotifyControl::kContinue;
+			}
+		};
+
+		void InstallQuickContainerTraceHook()
+		{
+			bool expected = false;
+			if (!g_quickContainerHookInstalled.compare_exchange_strong(expected, true)) {
 				return;
 			}
 
 			auto* controls = RE::PlayerControls::GetSingleton();
 			if (!controls) {
 				REX::WARN("Hotkey: PlayerControls not available");
-				g_inputHooksInstalled.store(false, std::memory_order_relaxed);
+				g_quickContainerHookInstalled.store(false, std::memory_order_relaxed);
 				return;
 			}
 
-			REX::INFO(
-				"Hotkey: installing PlayerControls QCOpenTransferMenu hooks for {} handlers",
-				controls->handlers.size());
+			auto* sinkBase = reinterpret_cast<void*>(
+				reinterpret_cast<std::uintptr_t>(controls) + kPlayerControlsQuickContainerSinkOffset);
+			auto** vtbl = *reinterpret_cast<void***>(sinkBase);
+			if (!vtbl) {
+				REX::WARN("Hotkey: PlayerControls QuickContainer sink vtable not resolved");
+				g_quickContainerHookInstalled.store(false, std::memory_order_relaxed);
+				return;
+			}
 
-			InstallNamedHandlerHook("Movement", controls->movementHandler, kBlockOtherQCOpenTransferMenuOriginal);
-			InstallNamedHandlerHook("Look", controls->lookHandler, kBlockOtherQCOpenTransferMenuOriginal);
-			InstallNamedHandlerHook("Sprint", controls->sprintHandler, kBlockOtherQCOpenTransferMenuOriginal);
-			InstallNamedHandlerHook("ReadyWeapon", controls->readyWeaponHandler, kBlockReadyWeaponQCOpenTransferMenuOriginal);
-			InstallNamedHandlerHook("AutoMove", controls->autoMoveHandler, kBlockOtherQCOpenTransferMenuOriginal);
-			InstallNamedHandlerHook("ToggleRun", controls->toggleRunHandler, kBlockOtherQCOpenTransferMenuOriginal);
-			InstallNamedHandlerHook("Activate", controls->activateHandler, kBlockActivateQCOpenTransferMenuOriginal);
-			InstallNamedHandlerHook("Jump", controls->jumpHandler, kBlockOtherQCOpenTransferMenuOriginal);
-			InstallNamedHandlerHook("Attack", controls->attackHandler, kBlockOtherQCOpenTransferMenuOriginal);
-			InstallNamedHandlerHook("Run", controls->runHandler, kBlockOtherQCOpenTransferMenuOriginal);
-			InstallNamedHandlerHook("Sneak", controls->sneakHandler, kBlockOtherQCOpenTransferMenuOriginal);
-			InstallNamedHandlerHook("TogglePOV", controls->togglePOVHandler, kBlockOtherQCOpenTransferMenuOriginal);
-			InstallNamedHandlerHook("MeleeThrow", controls->meleeThrowHandler, kBlockOtherQCOpenTransferMenuOriginal);
-			InstallNamedHandlerHook("GrabRotation", controls->grabRotationHandler, kBlockOtherQCOpenTransferMenuOriginal);
+			PlayerControlsQuickContainerHook::_original =
+				reinterpret_cast<PlayerControlsQuickContainerHook::func_t>(vtbl[kEventSinkProcessEventSlot]);
 
-			REX::INFO(
-				"Hotkey: installed {} handler hooks across {} unique vtables",
-				g_hookedHandlerCount,
-				g_hookedVTableCount);
+			WritePointer(
+				std::addressof(vtbl[kEventSinkProcessEventSlot]),
+				reinterpret_cast<const void*>(PlayerControlsQuickContainerHook::Thunk));
+
+			REX::INFO("Hotkey: PlayerControls QuickContainerStateEvent hook installed");
+			REX::INFO("Hotkey:  - playerControls     = {:p}", static_cast<void*>(controls));
+			REX::INFO("Hotkey:  - sinkBase           = {:p}", sinkBase);
+			REX::INFO("Hotkey:  - handler vtbl       = {:p}", static_cast<void*>(vtbl));
+			REX::INFO("Hotkey:  - hooked slot        = {}", kEventSinkProcessEventSlot);
+			REX::INFO("Hotkey:  - original slot[{}]  = {:p}", kEventSinkProcessEventSlot, reinterpret_cast<void*>(PlayerControlsQuickContainerHook::_original));
+			REX::INFO("Hotkey:  - block original     = {}", kBlockPlayerControlsQuickContainerOriginal);
+		}
+
+		struct MenuTraceSink :
+			RE::BSTEventSink<RE::MenuOpenCloseEvent>
+		{
+			static MenuTraceSink& GetSingleton()
+			{
+				static MenuTraceSink sink;
+				return sink;
+			}
+
+			RE::BSEventNotifyControl ProcessEvent(const RE::MenuOpenCloseEvent& a_event, RE::BSTEventSource<RE::MenuOpenCloseEvent>*) override
+			{
+				static const RE::BSFixedString kContainerMenu("ContainerMenu");
+				static const RE::BSFixedString kWorkshopMenu("WorkshopMenu");
+				static const RE::BSFixedString kPipboyWorkshopMenu("PipboyWorkshopMenu");
+
+				if (a_event.menuName == kContainerMenu ||
+					a_event.menuName == kWorkshopMenu ||
+					a_event.menuName == kPipboyWorkshopMenu) {
+					REX::INFO(
+						"UI: menu '{}' opening={}",
+						a_event.menuName.c_str(),
+						a_event.opening);
+				}
+
+				return RE::BSEventNotifyControl::kContinue;
+			}
+		};
+
+		void InstallMenuTraceSink()
+		{
+			bool expected = false;
+			if (!g_menuTraceInstalled.compare_exchange_strong(expected, true)) {
+				return;
+			}
+
+			auto* ui = RE::UI::GetSingleton();
+			if (!ui) {
+				REX::WARN("Hotkey: UI not available for menu trace");
+				g_menuTraceInstalled.store(false, std::memory_order_relaxed);
+				return;
+			}
+
+			ui->RegisterSink<RE::MenuOpenCloseEvent>(std::addressof(MenuTraceSink::GetSingleton()));
+			REX::INFO("Hotkey: MenuOpenCloseEvent trace sink installed");
 		}
 
 		void QueueOpenInventoryOnGameThread()
@@ -604,7 +691,9 @@ namespace Hotkey
 
 	void Start()
 	{
-		InstallPlayerControlsInputHooks();
+		InstallContainerMenuProcessMessageHook();
+		InstallMenuTraceSink();
+		InstallQuickContainerTraceHook();
 
 		bool expected = false;
 		if (!g_running.compare_exchange_strong(expected, true)) {
