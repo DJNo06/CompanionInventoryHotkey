@@ -18,6 +18,7 @@
 #include <RE/T/TESForm.h>
 #include <RE/T/TESObjectREFR.h>
 #include <RE/U/UI.h>
+#include <RE/U/UIMessageQueue.h>
 
 #include <REX/REX.h>
 
@@ -38,6 +39,7 @@ namespace Hotkey
 		std::atomic_bool     g_running{ false };
 		std::atomic_bool     g_containerMenuHookInstalled{ false };
 		std::atomic_bool     g_quickContainerHookInstalled{ false };
+		std::atomic_bool     g_uiMessageQueueHookInstalled{ false };
 		std::atomic_bool     g_menuTraceInstalled{ false };
 		std::thread          g_thread;
 
@@ -53,7 +55,8 @@ namespace Hotkey
 		constexpr std::size_t kEventSinkProcessEventSlot = 1;
 		constexpr std::size_t kPlayerControlsQuickContainerSinkOffset = 0x38;
 		constexpr bool        kBlockPlayerControlsQuickContainerOriginal = false;
-		constexpr bool        kBlockContainerMenuShowMessage = true;
+		constexpr bool        kBlockContainerMenuShowMessage = false;
+		constexpr bool        kBlockUIMessageQueueContainerMenuShow = true;
 
 		inline bool IsDown(int vk) noexcept
 		{
@@ -256,6 +259,69 @@ namespace Hotkey
 			default:
 				return "Unknown";
 			}
+		}
+
+		struct UIMessageQueueAddMessageHook
+		{
+			using queue_t = RE::UIMessageQueue;
+			using func_t = void(*)(queue_t*, const RE::BSFixedString&, RE::UI_MESSAGE_TYPE);
+
+			static inline REL::THook<void(queue_t*, const RE::BSFixedString&, RE::UI_MESSAGE_TYPE)>* _hook{ nullptr };
+
+			static void Thunk(queue_t* a_this, const RE::BSFixedString& a_menu, RE::UI_MESSAGE_TYPE a_type)
+			{
+				const bool isContainerMenu = a_menu == RE::BSFixedString(RE::ContainerMenu::MENU_NAME);
+				const bool isShow =
+					a_type == RE::UI_MESSAGE_TYPE::kShow ||
+					a_type == RE::UI_MESSAGE_TYPE::kReshow;
+
+				if (isContainerMenu || isShow) {
+					REX::INFO(
+						"UIMessageQueue: AddMessage menu='{}' type={} ({}) this={:p}",
+						a_menu.c_str(),
+						static_cast<std::int32_t>(a_type),
+						UIMessageTypeName(a_type),
+						static_cast<void*>(a_this));
+				}
+
+				if (kBlockUIMessageQueueContainerMenuShow &&
+					isContainerMenu &&
+					isShow) {
+					REX::INFO("UIMessageQueue(test): blocking AddMessage ContainerMenu {}", UIMessageTypeName(a_type));
+					return;
+				}
+
+				if (_hook) {
+					(*_hook)(a_this, a_menu, a_type);
+				}
+			}
+		};
+
+		void InstallUIMessageQueueHook()
+		{
+			bool expected = false;
+			if (!g_uiMessageQueueHookInstalled.compare_exchange_strong(expected, true)) {
+				return;
+			}
+
+			static REL::THook<void(RE::UIMessageQueue*, const RE::BSFixedString&, RE::UI_MESSAGE_TYPE)> hook(
+				"UIMessageQueue::AddMessage",
+				RE::ID::UIMessageQueue::AddMessage,
+				0,
+				UIMessageQueueAddMessageHook::Thunk);
+
+			UIMessageQueueAddMessageHook::_hook = std::addressof(hook);
+
+			if (!hook.GetEnabled()) {
+				if (!hook.Init() || !hook.Enable()) {
+					REX::WARN("Hotkey: failed to enable UIMessageQueue::AddMessage hook");
+					g_uiMessageQueueHookInstalled.store(false, std::memory_order_relaxed);
+					return;
+				}
+			}
+
+			REX::INFO("Hotkey: UIMessageQueue AddMessage hook installed");
+			REX::INFO("Hotkey:  - block container show = {}", kBlockUIMessageQueueContainerMenuShow);
 		}
 
 		struct ContainerMenuProcessMessageHook
@@ -691,6 +757,7 @@ namespace Hotkey
 
 	void Start()
 	{
+		InstallUIMessageQueueHook();
 		InstallContainerMenuProcessMessageHook();
 		InstallMenuTraceSink();
 		InstallQuickContainerTraceHook();
