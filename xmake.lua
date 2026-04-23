@@ -3,16 +3,16 @@ includes("lib/commonlibf4")
 
 -- set project constants
 set_project("CompanionInventoryHotkey")
-set_version("1.1.1")
+set_version("2.0.0")
 set_license("GPL-3.0")
 set_languages("c++23")
 set_warnings("allextra")
 
 -- version defines (safe for MSVC)
 add_defines(
-    "CIH_VER_MAJOR=1",
-    "CIH_VER_MINOR=1",
-    "CIH_VER_PATCH=1"
+    "CIH_VER_MAJOR=2",
+    "CIH_VER_MINOR=0",
+    "CIH_VER_PATCH=0"
 )
 
 -- add common rules
